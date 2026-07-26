@@ -76,6 +76,7 @@ _CRITICAL_BLOCKS: frozenset[BlockReason] = frozenset(
         BlockReason.SPREAD_TOO_WIDE,
         BlockReason.LIQUIDITY_BELOW_THRESHOLD,
         BlockReason.BOOK_TOO_THIN,
+        BlockReason.INSUFFICIENT_DEPTH_LEVELS,
     }
 )
 
@@ -115,6 +116,8 @@ class TradingStateMachine:
         "_confirmations",
         "_cooldown_until_ms",
         "_execution",
+        "_liquidation_forced",
+        "_liquidation_reason",
         "_ltp_config",
         "_position",
         "_quantity",
@@ -141,6 +144,8 @@ class TradingStateMachine:
         self._quantity = int(quantity)
         self._state = TradeState.WARMUP
         self._position: Position | None = None
+        self._liquidation_forced = False
+        self._liquidation_reason: str | None = None
         self._watch_deadline_ms = 0.0
         self._confirmations = 0
         self._confirmation_sign = 0
@@ -166,6 +171,8 @@ class TradingStateMachine:
         :meth:`force_flat`; this method does not silently discard one.
         """
         self._state = TradeState.WARMUP
+        self._liquidation_forced = False
+        self._liquidation_reason = None
         self._watch_deadline_ms = 0.0
         self._confirmations = 0
         self._confirmation_sign = 0
@@ -233,12 +240,13 @@ class TradingStateMachine:
     def force_flat(
         self, snapshot: Snapshot, reason: str
     ) -> StateMachineOutput:
-        """Close any open position immediately and reset to ``WARMUP``.
+        """Attempt immediate liquidation and reset only after a complete fill.
 
-        Called by the engine on a feed gap or a reconnect. Holding a position
-        whose supporting statistics have just been invalidated is not a
-        defensible state, so the position is closed at the current book and the
-        machine restarts its warmup.
+        Called by the engine on a feed gap or reconnect. If visible depth cannot
+        absorb the position, the machine deliberately remains in its directional
+        state with the full position intact; the normal update path will then
+        execute and account for one partial liquidation against the usable book.
+        Reporting flat before the model can fill the quantity would be unsafe.
         """
         previous_state = self._state
         now_ms = self._clock.monotonic_ms()
@@ -249,6 +257,29 @@ class TradingStateMachine:
             exit_quote, pnl = self._execution.mark_to_market(
                 position, snapshot, monotonic_ms=now_ms
             )
+            if not exit_quote.complete:
+                self._liquidation_forced = True
+                self._liquidation_reason = f"forced liquidation: {reason}"
+                reasons = (
+                    f"forced liquidation pending: {reason}",
+                    f"visible {exit_quote.filled_quantity}/{position.quantity}",
+                )
+                _LOGGER.warning(
+                    "%s: forced liquidation incomplete (%s), visible=%d/%d",
+                    snapshot.symbol,
+                    reason,
+                    exit_quote.filled_quantity,
+                    position.quantity,
+                )
+                return StateMachineOutput(
+                    state=self._state,
+                    transition=StateTransition(previous_state, self._state, ()),
+                    position=position,
+                    pnl=None,
+                    entry_quote=position.entry_quote,
+                    exit_quote=exit_quote,
+                    reasons=reasons,
+                )
             _LOGGER.warning(
                 "%s: forced flat (%s) at %.2f, net %.2f",
                 snapshot.symbol,
@@ -297,17 +328,21 @@ class TradingStateMachine:
                 self._state,
             )
             self._state = TradeState.NEUTRAL
+            self._liquidation_forced = False
+            self._liquidation_reason = None
             return self._stay(previous_state, ("inconsistent position state",))
 
-        exit_reason = self._exit_reason(
-            position=position,
-            snapshot=snapshot,
-            score=score,
-            confidence=confidence,
-            threshold=threshold,
-            quality=quality,
-            now_ms=now_ms,
-        )
+        exit_reason = self._liquidation_reason
+        if exit_reason is None:
+            exit_reason = self._exit_reason(
+                position=position,
+                snapshot=snapshot,
+                score=score,
+                confidence=confidence,
+                threshold=threshold,
+                quality=quality,
+                now_ms=now_ms,
+            )
         exit_quote, pnl = self._execution.mark_to_market(
             position, snapshot, monotonic_ms=now_ms
         )
@@ -322,6 +357,58 @@ class TradingStateMachine:
                 reasons=(f"holding {self._execution.unrealised_ticks(position, snapshot):+.1f}t",),
             )
 
+        if not exit_quote.complete:
+            remaining = position.quantity - exit_quote.filled_quantity
+            residual = self._execution.residual_position(
+                position,
+                exit_quote.filled_quantity,
+            )
+            self._position = residual
+            self._liquidation_reason = exit_reason
+            partial_reasons = (
+                f"partial exit: {exit_reason}",
+                f"filled {exit_quote.filled_quantity}/{exit_quote.requested_quantity}",
+                f"remaining {remaining}",
+            )
+            _LOGGER.warning(
+                "%s: %s partial exit (%s), filled=%d remaining=%d",
+                snapshot.symbol,
+                position.direction.name,
+                exit_reason,
+                exit_quote.filled_quantity,
+                remaining,
+            )
+            return StateMachineOutput(
+                state=self._state,
+                transition=StateTransition(previous_state, self._state, ()),
+                position=residual,
+                pnl=pnl if exit_quote.filled_quantity > 0 else None,
+                entry_quote=position.entry_quote,
+                exit_quote=exit_quote,
+                reasons=partial_reasons,
+            )
+
+        if self._liquidation_forced:
+            reasons = (
+                f"forced liquidation complete: {exit_reason}",
+                f"net {pnl.net_rupees:+.2f}",
+            )
+            self._position = None
+            self.reset()
+            return StateMachineOutput(
+                state=TradeState.WARMUP,
+                transition=StateTransition(
+                    previous_state,
+                    TradeState.WARMUP,
+                    reasons,
+                ),
+                position=None,
+                pnl=pnl,
+                entry_quote=position.entry_quote,
+                exit_quote=exit_quote,
+                reasons=reasons,
+            )
+
         exit_state = (
             TradeState.EXIT_LONG
             if position.direction is Direction.LONG
@@ -331,6 +418,8 @@ class TradingStateMachine:
         self._cooldown_until_ms = now_ms + self._config.cooldown_ms
         self._rearm_block_sign = position.direction.signum
         self._position = None
+        self._liquidation_forced = False
+        self._liquidation_reason = None
         self._confirmations = 0
         self._confirmation_sign = 0
         reasons = (f"exit: {exit_reason}", f"net {pnl.net_rupees:+.2f}")
@@ -367,12 +456,19 @@ class TradingStateMachine:
     ) -> str | None:
         """Return the first applicable exit reason, or ``None`` to keep holding.
 
-        The stop is checked before the minimum holding time: a minimum hold is a
-        protection against noise, not a licence to sit through a stop.
+        The stop and critical feed/book quality failures are checked before the
+        minimum holding time: a minimum hold is a protection against signal
+        noise, not a licence to sit through a stop or an unsafe execution book.
         """
         config = self._config
         if self._execution.stop_hit(position, snapshot):
             return "stop"
+        if config.exit_on_quality_loss:
+            critical = [
+                reason.value for reason in quality.reasons if reason in _CRITICAL_BLOCKS
+            ]
+            if critical:
+                return "quality: " + "+".join(critical)
 
         holding_ms = now_ms - position.entry_monotonic_ms
         if holding_ms < config.min_hold_ms:
@@ -388,12 +484,6 @@ class TradingStateMachine:
             return "composite reversal"
         if confidence < config.exit_confidence:
             return f"confidence {confidence:.2f}"
-        if config.exit_on_quality_loss:
-            critical = [
-                reason.value for reason in quality.reasons if reason in _CRITICAL_BLOCKS
-            ]
-            if critical:
-                return "quality: " + "+".join(critical)
         return None
 
     def _handle_post_exit(
@@ -537,7 +627,16 @@ class TradingStateMachine:
                 return f"traded price contradicts long ({ltp.value:+.2f})"
             if direction_sign < 0 and ltp.value >= opposition:
                 return f"traded price contradicts short ({ltp.value:+.2f})"
-        allowed, detail = self._execution.clears_cost(snapshot, self._entry_quantity())
+        direction = Direction.LONG if direction_sign > 0 else Direction.SHORT
+        quantity = self._entry_quantity()
+        fillable, detail = self._execution.entry_is_fillable(
+            snapshot,
+            direction,
+            quantity,
+        )
+        if not fillable:
+            return f"execution gate: {detail}"
+        allowed, detail = self._execution.clears_cost(snapshot, quantity)
         if not allowed:
             return f"cost gate: {detail}"
         return None
@@ -562,6 +661,7 @@ class TradingStateMachine:
             snapshot, direction, self._quantity, monotonic_ms=now_ms
         )
         self._position = position
+        self._liquidation_reason = None
         self._state = TradeState.LONG if direction_sign > 0 else TradeState.SHORT
         self._confirmations = 0
         reasons = (

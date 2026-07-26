@@ -16,6 +16,9 @@ engine are written against the protocol and never against a specific transport:
 ``ScenarioSource``
     Exactly reproducible upward/downward streams plus three noise and three
     seeded random pattern families. Also explicitly not market data.
+``ExtremeStressSource``
+    Eleven deterministic adversarial market, feed and execution fixtures for
+    fail-safe testing. These are synthetic software inputs, not market data.
 
 ``SnapshotRecorder`` writes the engine's normalised snapshot form, which is what
 ``ReplaySource`` consumes.
@@ -34,11 +37,15 @@ from .scenarios import (
     ScenarioConfig,
     ScenarioSource,
 )
+from .stress import ExtremeStressConfig, ExtremeStressPattern, ExtremeStressSource
 from .synthetic import SyntheticConfig, SyntheticSource
 
 __all__ = [
     "AdapterUnavailableError",
     "AngelOneAdapter",
+    "ExtremeStressConfig",
+    "ExtremeStressPattern",
+    "ExtremeStressSource",
     "LoginError",
     "MarketScenario",
     "NoisePattern",

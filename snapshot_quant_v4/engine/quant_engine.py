@@ -494,7 +494,10 @@ class SymbolEngine:
         """
         reasons: list[str] = []
         if forced_flat:
-            reasons.append("! state reset after feed gap")
+            if self._state_machine.position is None:
+                reasons.append("! state reset after feed gap")
+            else:
+                reasons.append("! statistics reset; forced liquidation remains open")
 
         contributions = composite.contributions
         ranked = sorted(
