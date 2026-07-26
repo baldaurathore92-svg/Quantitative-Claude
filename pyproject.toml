@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapshot-quant-v4"
+version = "4.0.0"
+description = "Deterministic snapshot-only quant engine for the NSE cash market (Angel One SmartAPI V2 SnapQuote)"
+requires-python = ">=3.11"
+readme = "README.md"
+# The engine core, the replay source, the tests and the benchmark run on the
+# standard library alone. Both third-party packages are optional and are imported
+# lazily at their point of use, so a research or backtest process never needs them.
+dependencies = []
+
+[project.optional-dependencies]
+live = ["smartapi-python>=1.4", "websocket-client>=1.6"]
+console = ["rich>=13.0"]
+dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+snapshot-quant-v4 = "snapshot_quant_v4.main:main"
+
+[tool.setuptools.packages.find]
+include = ["snapshot_quant_v4*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["snapshot_quant_v4", "tests", "bench"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "N",    # naming
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "BLE",  # blind except: every one must be justified with a noqa reason
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RET",  # return consistency
+    "ARG",  # unused arguments
+    "PTH",  # pathlib
+    "TRY",  # exception anti-patterns
+    "PERF", # performance anti-patterns
+    "RUF",
+]
+ignore = [
+    "TRY003",  # long messages inside raise: precise diagnostics are worth it here
+    "TRY400",  # logger.error is deliberate where a traceback adds nothing
+    "PERF203", # try/except inside a loop is intentional in the drain paths
+    "B008",
+    "RUF001",  # box-drawing and bar glyphs in the renderer are intentional
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately touch private members to assert on internal invariants, and
+# their fixtures use loose typing by design.
+"tests/*" = ["ARG002", "SLF001", "N802", "B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+namespace_packages = true
+files = ["snapshot_quant_v4"]
+
+[[tool.mypy.overrides]]
+# The SmartAPI client ships no type information and is imported lazily.
+module = ["SmartApi.*", "smartapi.*", "rich.*"]
+ignore_missing_imports = true

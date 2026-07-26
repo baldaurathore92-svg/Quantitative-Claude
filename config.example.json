@@ -1,0 +1,97 @@
+{
+  "credentials": {
+    "api_key": "",
+    "client_code": "",
+    "pin": "",
+    "totp_secret": ""
+  },
+  "symbols": [
+    { "token": "3045", "symbol": "SBIN", "exchange_type": 1, "tick_size": 0.05, "quantity": 1 },
+    { "token": "1594", "symbol": "INFY", "exchange_type": 1, "tick_size": 0.05, "quantity": 1 }
+  ],
+  "validation": {
+    "max_spread_ticks": 25.0,
+    "max_snapshot_gap_ms": 3000.0,
+    "max_staleness_ms": 8000.0,
+    "max_price_gap_ticks": 40.0,
+    "require_tick_alignment": false,
+    "allow_locked_book": false
+  },
+  "quality": {
+    "max_signal_spread_ticks": 4.0,
+    "min_depth_levels": 2,
+    "min_relative_depth": 0.35,
+    "gap_block_ms": 2000.0,
+    "warmup_snapshots": 60
+  },
+  "features": {
+    "weighted_obi": {
+      "decay_ticks": 2.5,
+      "primary_levels": 2,
+      "deep_levels": 5,
+      "deep_agreement_weight": 0.35,
+      "aggregate_agreement_weight": 0.2
+    },
+    "momentum": { "fast_half_life_ms": 600.0, "slow_half_life_ms": 3000.0 },
+    "refill": {
+      "consumption_fraction": 0.35,
+      "recovery_fraction": 0.6,
+      "window_ms": 1500.0,
+      "volume_confirmation_ratio": 0.5
+    },
+    "ltp_confirmation": { "scale_ticks": 1.5, "opposition_threshold": 0.35 }
+  },
+  "regime": {
+    "er_trend": 0.45,
+    "er_range": 0.25,
+    "vol_high_ticks": 2.5,
+    "vol_low_ticks": 0.8,
+    "min_dwell_snapshots": 8,
+    "confirm_snapshots": 3
+  },
+  "composite": {
+    "smoothing_half_life_ms": 700.0,
+    "min_features": 3,
+    "collinear_groups": { "microprice|weighted_obi": 0.3 }
+  },
+  "threshold": {
+    "base": 0.3,
+    "min_entry": 0.18,
+    "max_entry": 0.85,
+    "watch_ratio": 0.6,
+    "exit_ratio": 0.5
+  },
+  "state_machine": {
+    "watch_timeout_ms": 2500.0,
+    "entry_confirmations": 2,
+    "min_entry_confidence": 0.55,
+    "max_hold_ms": 60000.0,
+    "cooldown_ms": 1500.0,
+    "stop_ticks": 6.0,
+    "target_ticks": 12.0,
+    "require_ltp_confirmation": true
+  },
+  "execution": {
+    "entry_aggression_bps": 3.0,
+    "exit_slippage_bps": 1.0,
+    "use_depth_walk": false,
+    "enforce_cost_gate": false,
+    "min_edge_multiple": 1.5,
+    "cost": { "enabled": true, "brokerage_flat_per_order": 20.0 }
+  },
+  "runtime": {
+    "queue_size": 4096,
+    "render_fps": 6.0,
+    "log_level": "INFO",
+    "log_file": "logs/snapshot_quant_v4.log",
+    "log_console": false,
+    "renderer": "auto"
+  },
+  "adapter": {
+    "subscription_mode": 3,
+    "correlation_id": "sq4",
+    "reconnect_initial_ms": 1000.0,
+    "reconnect_max_ms": 30000.0,
+    "reconnect_jitter_ratio": 0.25
+  }
+}

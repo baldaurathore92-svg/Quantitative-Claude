@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime artefacts. config.json holds credentials and is deliberately ignored;
+# config.example.json is the version-controlled template.
+config.json
+logs/
+recordings/
+*.jsonl
