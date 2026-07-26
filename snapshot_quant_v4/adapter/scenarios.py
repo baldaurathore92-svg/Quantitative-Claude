@@ -1,15 +1,15 @@
 """Deterministic tick-by-tick market scenarios for pipeline audits.
 
 These streams are controlled research fixtures, not market simulators and not
-strategy evidence.  Their purpose is to make the full engine react to four
-known input shapes while preserving the structural rules of a SnapQuote book:
-strictly increasing time/sequence/volume, tick-aligned uncrossed prices and five
-sorted depth levels.
+strategy evidence. Their purpose is to make the full engine react to known input
+shapes while preserving SnapQuote structure: increasing time, sequence and
+volume, tick-aligned uncrossed prices, and five sorted depth levels.
 
-``UPWARD`` and ``DOWNWARD`` move exactly one price tick per snapshot and carry
-matching one-sided book pressure. ``NOISE`` uses a zero-sum cycle of irregular
-multi-tick changes and rapidly reversing pressure. ``RANDOM`` is a seeded random
-walk whose outcome is reproducible but intentionally has no expected direction.
+``UPWARD`` and ``DOWNWARD`` move exactly one tick per snapshot. ``NOISE`` offers
+three zero-sum choppy patterns (whipsaw, burst reversal and volatility cluster).
+``RANDOM`` offers three seeded stochastic processes (unbiased walk, mean
+reversion and trend switching). Every variant is exactly reproducible after
+:meth:`ScenarioSource.start` and owns no global mutable state.
 """
 
 from __future__ import annotations
@@ -23,14 +23,13 @@ from enum import StrEnum
 from ..utils.constants import SNAPQUOTE_DEPTH_LEVELS
 from ..utils.types import DepthLevel, RawSnapshot
 
-_NOISE_STEPS: tuple[int, ...] = (4, -7, 6, -5, 7, -6, 3, -2)
-_NOISE_SPREADS: tuple[int, ...] = (1, 3, 2, 4, 1, 4, 2, 3)
 _DEPTH_PROFILE: tuple[float, ...] = (1.00, 0.82, 0.67, 0.55, 0.45)
 _MIN_SIDE_SCALE = 0.12
+_TREND_BLOCK_LENGTH = 40
 
 
 class MarketScenario(StrEnum):
-    """Named deterministic input shapes supported by :class:`ScenarioSource`."""
+    """Top-level deterministic input shapes supported by the source."""
 
     UPWARD = "UPWARD"
     DOWNWARD = "DOWNWARD"
@@ -38,14 +37,45 @@ class MarketScenario(StrEnum):
     RANDOM = "RANDOM"
 
 
+class NoisePattern(StrEnum):
+    """Directionless high-volatility paths available under ``NOISE``."""
+
+    WHIPSAW = "WHIPSAW"
+    BURST_REVERSAL = "BURST_REVERSAL"
+    VOLATILITY_CLUSTER = "VOLATILITY_CLUSTER"
+
+
+class RandomPattern(StrEnum):
+    """Seeded stochastic paths available under ``RANDOM``."""
+
+    UNBIASED_WALK = "UNBIASED_WALK"
+    MEAN_REVERTING = "MEAN_REVERTING"
+    TREND_SWITCHING = "TREND_SWITCHING"
+
+
+_NOISE_STEPS: dict[NoisePattern, tuple[int, ...]] = {
+    NoisePattern.WHIPSAW: (4, -7, 6, -5, 7, -6, 3, -2),
+    NoisePattern.BURST_REVERSAL: (1, 1, 1, 6, -1, -1, -1, -6),
+    NoisePattern.VOLATILITY_CLUSTER: (1, -1, 1, -1, 8, -8, 7, -7),
+}
+_NOISE_SPREADS: dict[NoisePattern, tuple[int, ...]] = {
+    NoisePattern.WHIPSAW: (1, 3, 2, 4, 1, 4, 2, 3),
+    NoisePattern.BURST_REVERSAL: (1, 1, 2, 4, 1, 1, 2, 4),
+    NoisePattern.VOLATILITY_CLUSTER: (1, 1, 1, 2, 4, 4, 3, 3),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ScenarioConfig:
-    """Configuration shared by all deterministic scenarios.
+    """Configuration shared by all deterministic scenarios and patterns.
 
-    ``start_price_paise`` is the initial best bid, not a floating mid-price.
-    Integer paise arithmetic keeps every generated price exactly on the tick
-    grid.  A fixed timestamp origin makes complete ``RawSnapshot`` records equal
-    across restarts, including their timing fields.
+    ``start_price_paise`` is the initial best bid. Integer paise arithmetic
+    keeps generated prices on the tick grid, while a fixed timestamp origin
+    makes complete :class:`RawSnapshot` records equal across restarts.
+
+    Pattern fields are orthogonal: ``noise_pattern`` is consulted only for a
+    ``NOISE`` scenario and ``random_pattern`` only for ``RANDOM``. Defaults
+    preserve the original whipsaw and unbiased-walk behaviour.
     """
 
     scenario: MarketScenario = MarketScenario.UPWARD
@@ -61,6 +91,8 @@ class ScenarioConfig:
     base_timestamp_ms: int = 1_753_500_000_000
     count: int = 600
     seed: int = 20_260_726
+    noise_pattern: NoisePattern = NoisePattern.WHIPSAW
+    random_pattern: RandomPattern = RandomPattern.UNBIASED_WALK
 
     def __post_init__(self) -> None:
         if not self.token.strip():
@@ -91,14 +123,18 @@ class ScenarioConfig:
         ):
             raise ValueError("DOWNWARD scenario reaches a non-positive depth price")
 
+    @property
+    def pattern_name(self) -> str:
+        """Stable report label for the active scenario/pattern combination."""
+        if self.scenario is MarketScenario.NOISE:
+            return f"{self.scenario.value}/{self.noise_pattern.value}"
+        if self.scenario is MarketScenario.RANDOM:
+            return f"{self.scenario.value}/{self.random_pattern.value}"
+        return self.scenario.value
+
 
 class ScenarioSource:
-    """Restartable source for one named deterministic market scenario.
-
-    The generator owns no global state. Calling :meth:`start` resets both its
-    random generator and emitted counter, so collecting the source twice yields
-    byte-for-byte equal snapshots for every scenario.
-    """
+    """Restartable source for one deterministic scenario/pattern combination."""
 
     __slots__ = ("_config", "_emitted", "_paced", "_rng", "_stop")
 
@@ -121,8 +157,13 @@ class ScenarioSource:
 
     @property
     def scenario(self) -> MarketScenario:
-        """The selected named scenario."""
+        """Selected top-level scenario."""
         return self._config.scenario
+
+    @property
+    def pattern_name(self) -> str:
+        """Selected scenario/pattern label used by tests and reports."""
+        return self._config.pattern_name
 
     def start(self) -> None:
         """Reset lifecycle and pseudo-random state for exact replay."""
@@ -142,12 +183,34 @@ class ScenarioSource:
         volume = config.initial_volume
         session_high_paise = best_bid_paise + config.tick_paise
         session_low_paise = best_bid_paise
+        trend_bias = 0
+        if (
+            config.scenario is MarketScenario.RANDOM
+            and config.random_pattern is RandomPattern.TREND_SWITCHING
+        ):
+            trend_bias = rng.choice((-1, 1))
 
         for index in range(config.count):
             if self._stop.is_set():
                 return
 
-            step_ticks, pressure, spread_ticks, traded = self._market_step(index, rng)
+            if (
+                config.scenario is MarketScenario.RANDOM
+                and config.random_pattern is RandomPattern.TREND_SWITCHING
+                and index > 0
+                and index % _TREND_BLOCK_LENGTH == 0
+            ):
+                # Alternating the seeded initial direction guarantees both trend
+                # signs are exercised; movement inside each block remains random.
+                trend_bias = -trend_bias
+
+            offset_ticks = (best_bid_paise - config.start_price_paise) // config.tick_paise
+            step_ticks, pressure, spread_ticks, traded = self._market_step(
+                index,
+                rng,
+                offset_ticks=offset_ticks,
+                trend_bias=trend_bias,
+            )
             if index > 0 or config.scenario in (MarketScenario.NOISE, MarketScenario.RANDOM):
                 best_bid_paise += step_ticks * config.tick_paise
             minimum_bid = config.tick_paise * (SNAPQUOTE_DEPTH_LEVELS + 1)
@@ -191,25 +254,77 @@ class ScenarioSource:
         self,
         index: int,
         rng: random.Random,
+        *,
+        offset_ticks: int,
+        trend_bias: int,
     ) -> tuple[int, float, int, int]:
         """Return movement, pressure, spread and traded quantity for one event."""
-        scenario = self._config.scenario
-        if scenario is MarketScenario.UPWARD:
-            return 1, 0.78, 1, self._config.trade_size
-        if scenario is MarketScenario.DOWNWARD:
-            return -1, -0.78, 1, self._config.trade_size
-        if scenario is MarketScenario.NOISE:
-            cycle = index % len(_NOISE_STEPS)
-            step = _NOISE_STEPS[cycle]
-            pressure = 0.88 if step > 0 else -0.88
-            traded = self._config.trade_size + (index % 5) * 17
-            return step, pressure, _NOISE_SPREADS[cycle], traded
+        config = self._config
+        if config.scenario is MarketScenario.UPWARD:
+            return 1, 0.78, 1, config.trade_size
+        if config.scenario is MarketScenario.DOWNWARD:
+            return -1, -0.78, 1, config.trade_size
+        if config.scenario is MarketScenario.NOISE:
+            return self._noise_step(index, rng)
+        return self._random_step(rng, offset_ticks=offset_ticks, trend_bias=trend_bias)
 
-        step = rng.choice((-2, -1, -1, 0, 0, 1, 1, 2))
-        directional_component = 0.22 * step
-        pressure = max(-0.90, min(0.90, directional_component + rng.uniform(-0.58, 0.58)))
-        spread = 1 if rng.random() < 0.78 else rng.choice((2, 3, 4))
-        traded = rng.randint(max(1, self._config.trade_size // 3), self._config.trade_size * 2)
+    def _noise_step(
+        self,
+        index: int,
+        rng: random.Random,
+    ) -> tuple[int, float, int, int]:
+        """Return one event from the selected zero-sum noise cycle."""
+        pattern = self._config.noise_pattern
+        steps = _NOISE_STEPS[pattern]
+        spreads = _NOISE_SPREADS[pattern]
+        cycle = index % len(steps)
+        step = steps[cycle]
+        pressure_magnitude = {
+            NoisePattern.WHIPSAW: 0.88,
+            NoisePattern.BURST_REVERSAL: 0.82,
+            NoisePattern.VOLATILITY_CLUSTER: 0.90,
+        }[pattern]
+        pressure = pressure_magnitude if step > 0 else -pressure_magnitude
+        # WHIPSAW is the original public default. It intentionally consumes no
+        # extra RNG draw here, preserving its complete historical stream (trade
+        # quantities, cumulative volume and subsequent randomised depth).
+        traded = self._config.trade_size + (index % 5) * 17
+        if pattern is not NoisePattern.WHIPSAW:
+            traded += rng.randint(0, 9)
+        return step, pressure, spreads[cycle], traded
+
+    def _random_step(
+        self,
+        rng: random.Random,
+        *,
+        offset_ticks: int,
+        trend_bias: int,
+    ) -> tuple[int, float, int, int]:
+        """Return one event from the selected seeded stochastic process."""
+        pattern = self._config.random_pattern
+        if pattern is RandomPattern.UNBIASED_WALK:
+            step = rng.choice((-2, -1, -1, 0, 0, 1, 1, 2))
+            structural_pressure = 0.22 * step
+        elif pattern is RandomPattern.MEAN_REVERTING:
+            shock = rng.choice((-2, -1, -1, 0, 0, 1, 1, 2))
+            pull = -1 if offset_ticks >= 4 else 1 if offset_ticks <= -4 else 0
+            step = max(-2, min(2, shock + pull))
+            structural_pressure = 0.20 * step - 0.025 * offset_ticks
+        else:
+            step = trend_bias + rng.choice((-1, 0, 0, 0, 1))
+            structural_pressure = 0.48 * trend_bias + 0.14 * step
+
+        noise_width = 0.58 if pattern is not RandomPattern.TREND_SWITCHING else 0.24
+        pressure = max(
+            -0.90,
+            min(0.90, structural_pressure + rng.uniform(-noise_width, noise_width)),
+        )
+        narrow_probability = 0.78 if pattern is not RandomPattern.TREND_SWITCHING else 0.88
+        spread = 1 if rng.random() < narrow_probability else rng.choice((2, 3, 4))
+        traded = rng.randint(
+            max(1, self._config.trade_size // 3),
+            self._config.trade_size * 2,
+        )
         return step, pressure, spread, traded
 
     def _ladder(
@@ -242,4 +357,10 @@ class ScenarioSource:
         return tuple(levels)
 
 
-__all__ = ["MarketScenario", "ScenarioConfig", "ScenarioSource"]
+__all__ = [
+    "MarketScenario",
+    "NoisePattern",
+    "RandomPattern",
+    "ScenarioConfig",
+    "ScenarioSource",
+]

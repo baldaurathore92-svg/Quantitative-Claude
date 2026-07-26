@@ -1,10 +1,11 @@
-"""Observable full-pipeline audit for four deterministic market scenarios.
+"""Observable full-pipeline audit for deterministic scenario pattern families.
 
 This is a software-behaviour audit, not a backtest and not evidence of expected
-market returns. It sends every synthetic tick through the production validator,
-statistics, features, regime, quality, confidence, composite, threshold, state
-machine and execution model, then reports distributions rather than hiding the
-result behind pass/fail assertions.
+market returns. It sends upward/downward plus three noise and three random
+patterns through the production validator, statistics, features, regime,
+quality, confidence, composite, threshold, state machine and execution model.
+It reports every distribution plus a cross-pattern comparison rather than
+hiding the result behind pass/fail assertions.
 
 Usage::
 
@@ -16,18 +17,24 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import math
 import statistics
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import pairwise
 from pathlib import Path
 
 if __package__ in (None, ""):  # pragma: no cover - direct script execution
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from snapshot_quant_v4.adapter import MarketScenario, ScenarioConfig, ScenarioSource
+from snapshot_quant_v4.adapter import (
+    MarketScenario,
+    NoisePattern,
+    RandomPattern,
+    ScenarioConfig,
+    ScenarioSource,
+)
 from snapshot_quant_v4.config import config_from_mapping
 from snapshot_quant_v4.engine.quant_engine import EngineRegistry
 from snapshot_quant_v4.utils.clock import ManualClock
@@ -37,6 +44,32 @@ _TOKEN = "3045"
 _SYMBOL = "SBIN"
 _TICK_SIZE = 0.05
 _WARMUP_CUTOFF = 60
+
+
+@dataclass(frozen=True, slots=True)
+class AuditCase:
+    """One top-level scenario plus its active pattern selection."""
+
+    scenario: MarketScenario
+    noise_pattern: NoisePattern = NoisePattern.WHIPSAW
+    random_pattern: RandomPattern = RandomPattern.UNBIASED_WALK
+
+    @property
+    def label(self) -> str:
+        """Stable scenario/pattern report label."""
+        return ScenarioConfig(
+            scenario=self.scenario,
+            noise_pattern=self.noise_pattern,
+            random_pattern=self.random_pattern,
+        ).pattern_name
+
+
+_AUDIT_CASES: tuple[AuditCase, ...] = (
+    AuditCase(MarketScenario.UPWARD),
+    AuditCase(MarketScenario.DOWNWARD),
+    *(AuditCase(MarketScenario.NOISE, noise_pattern=pattern) for pattern in NoisePattern),
+    *(AuditCase(MarketScenario.RANDOM, random_pattern=pattern) for pattern in RandomPattern),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +84,9 @@ class FeatureAudit:
 
 @dataclass(frozen=True, slots=True)
 class AuditResult:
-    """All metrics produced for one named scenario."""
+    """All metrics produced for one scenario/pattern case."""
 
+    label: str
     scenario: MarketScenario
     snapshots: int
     stats: EngineStats
@@ -136,14 +170,16 @@ def audit_config():
 
 
 def build_snapshots(
-    scenario: MarketScenario,
+    case: AuditCase,
     count: int,
     seed: int,
 ) -> list[RawSnapshot]:
-    """Materialise one deterministic scenario before timing the engine."""
+    """Materialise one deterministic scenario/pattern before engine timing."""
     source = ScenarioSource(
         ScenarioConfig(
-            scenario=scenario,
+            scenario=case.scenario,
+            noise_pattern=case.noise_pattern,
+            random_pattern=case.random_pattern,
             token=_TOKEN,
             symbol=_SYMBOL,
             count=count,
@@ -168,37 +204,9 @@ def process(snapshots: list[RawSnapshot]) -> tuple[list[EngineOutput], EngineSta
 
 
 def decision_digest(outputs: list[EngineOutput]) -> str:
-    """Hash every deterministic decision field, excluding measured latency."""
-    records = [
-        (
-            output.snapshot_index,
-            output.state.value,
-            output.transition.previous.value,
-            output.regime.regime.value,
-            output.composite.score,
-            output.composite.smoothed,
-            output.composite.confidence,
-            output.composite.valid,
-            output.threshold.entry,
-            output.threshold.watch,
-            output.threshold.exit,
-            output.quality.tradable,
-            tuple(reason.value for reason in output.quality.reasons),
-            tuple(
-                (
-                    name,
-                    feature.raw,
-                    feature.value,
-                    feature.confidence,
-                    feature.valid,
-                )
-                for name, feature in output.features.items()
-            ),
-        )
-        for output in outputs
-    ]
-    payload = json.dumps(records, separators=(",", ":"), allow_nan=False).encode()
-    return hashlib.sha256(payload).hexdigest()
+    """Hash complete engine outputs, excluding only measured compute latency."""
+    deterministic = tuple(replace(output, compute_us=0.0) for output in outputs)
+    return hashlib.sha256(repr(deterministic).encode()).hexdigest()
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -236,10 +244,26 @@ def invariant_violations(
         previous_volume = raw.volume_traded_today
         if len(raw.bids) != 5 or len(raw.asks) != 5:
             fail(f"tick {index}: book does not contain five levels per side")
+            continue
         if raw.bids[0].price_paise >= raw.asks[0].price_paise:
             fail(f"tick {index}: locked or crossed book")
-        if any(level.price_paise % 5 for level in (*raw.bids, *raw.asks)):
+        if any(
+            left.price_paise <= right.price_paise
+            for left, right in pairwise(raw.bids)
+        ):
+            fail(f"tick {index}: bids are not strictly descending")
+        if any(
+            left.price_paise >= right.price_paise
+            for left, right in pairwise(raw.asks)
+        ):
+            fail(f"tick {index}: asks are not strictly ascending")
+        levels = (*raw.bids, *raw.asks)
+        if any(level.price_paise % 5 for level in levels):
             fail(f"tick {index}: off-tick depth price")
+        if any(level.quantity <= 0 or level.orders <= 0 for level in levels):
+            fail(f"tick {index}: non-positive depth quantity/orders")
+        if raw.last_traded_price not in (raw.bids[0].price, raw.asks[0].price):
+            fail(f"tick {index}: LTP is not at either touch")
 
     previous_state = None
     for output in outputs:
@@ -263,6 +287,11 @@ def invariant_violations(
         if not 0.0 <= output.composite.confidence <= 1.0:
             fail(f"output {index}: confidence out of bounds")
         if not (
+            0.0 <= output.quality.book_quality <= 1.0
+            and 0.0 <= output.quality.liquidity_score <= 1.0
+        ):
+            fail(f"output {index}: quality metric out of bounds")
+        if not (
             0.0
             <= output.threshold.exit
             <= output.threshold.watch
@@ -275,13 +304,19 @@ def invariant_violations(
             if not (
                 math.isfinite(feature.raw)
                 and math.isfinite(feature.value)
+                and math.isfinite(feature.local_confidence)
                 and math.isfinite(feature.confidence)
             ):
                 fail(f"output {index}: {feature.name} is non-finite")
             if not low <= feature.value <= 1.0:
                 fail(f"output {index}: {feature.name} value out of bounds")
-            if not 0.0 <= feature.confidence <= 1.0:
+            if not (
+                0.0 <= feature.local_confidence <= 1.0
+                and 0.0 <= feature.confidence <= 1.0
+            ):
                 fail(f"output {index}: {feature.name} confidence out of bounds")
+        if output.position is not None and not output.position.is_open:
+            fail(f"output {index}: reported position is not open")
         if output.pnl is not None:
             expected_gross = (
                 (output.pnl.exit_price - output.pnl.entry_price)
@@ -334,15 +369,20 @@ def feature_summary(outputs: list[EngineOutput]) -> tuple[FeatureAudit, ...]:
     )
 
 
-def audit_scenario(scenario: MarketScenario, count: int, seed: int) -> AuditResult:
-    """Run and summarise one scenario, including an independent replay check."""
-    snapshots = build_snapshots(scenario, count, seed)
+def audit_scenario(case: AuditCase, count: int, seed: int) -> AuditResult:
+    """Run and summarise one pattern, including independent source/decision replay."""
+    snapshots = build_snapshots(case, count, seed)
     outputs, stats = process(snapshots)
-    replay_outputs, _ = process(build_snapshots(scenario, count, seed))
+    replay_snapshots = build_snapshots(case, count, seed)
+    replay_outputs, _ = process(replay_snapshots)
     digest = decision_digest(outputs)
     replay_digest = decision_digest(replay_outputs)
+    raw_deterministic = snapshots == replay_snapshots
+    decisions_deterministic = digest == replay_digest
     violations = invariant_violations(snapshots, outputs, stats)
-    if digest != replay_digest:
+    if not raw_deterministic:
+        violations.append("raw snapshot sequence differs on exact replay")
+    if not decisions_deterministic:
         violations.append("decision sequence differs on exact replay")
 
     mature = outputs[min(_WARMUP_CUTOFF, len(outputs) - 1) :]
@@ -375,7 +415,8 @@ def audit_scenario(scenario: MarketScenario, count: int, seed: int) -> AuditResu
     ) / _TICK_SIZE
 
     return AuditResult(
-        scenario=scenario,
+        label=case.label,
+        scenario=case.scenario,
         snapshots=len(snapshots),
         stats=stats,
         price_delta_ticks=tick_delta,
@@ -402,7 +443,7 @@ def audit_scenario(scenario: MarketScenario, count: int, seed: int) -> AuditResu
         latency_p99_us=percentile(latencies, 0.99),
         latency_max_us=max(latencies),
         decision_digest=digest[:16],
-        deterministic=digest == replay_digest,
+        deterministic=raw_deterministic and decisions_deterministic,
         violations=tuple(violations),
     )
 
@@ -418,7 +459,7 @@ def format_counts(counts: dict[str, int]) -> str:
 def print_result(result: AuditResult) -> None:
     """Print one dense, operator-readable scenario report."""
     stats = result.stats
-    print(f"\n=== {result.scenario.value} ===")
+    print(f"\n=== {result.label} ===")
     print(
         f"ticks={result.snapshots} accepted={stats.accepted} rejected={stats.rejected} "
         f"blocked={stats.blocked} tradable={result.tradable} "
@@ -465,15 +506,33 @@ def print_result(result: AuditResult) -> None:
 
 
 def run(count: int, seed: int) -> list[AuditResult]:
-    """Audit all four scenarios in declaration order."""
-    return [audit_scenario(scenario, count, seed) for scenario in MarketScenario]
+    """Audit upward/downward and every noise/random pattern in stable order."""
+    return [audit_scenario(case, count, seed) for case in _AUDIT_CASES]
+
+
+def print_comparison(results: list[AuditResult]) -> None:
+    """Print a compact cross-pattern table for direct behavioural comparison."""
+    print("\n=== CROSS-PATTERN COMPARISON ===")
+    print(
+        f"{'pattern':<34} {'delta':>8} {'dominant':>10} {'score':>8} "
+        f"{'conf':>7} {'thresh':>7} {'entries':>7} {'p99us':>8} {'check':>6}"
+    )
+    for result in results:
+        dominant = max(result.regime_counts, key=result.regime_counts.__getitem__)
+        check = "PASS" if result.deterministic and not result.violations else "FAIL"
+        print(
+            f"{result.label:<34} {result.price_delta_ticks:+7.1f}t "
+            f"{dominant:>10} {result.score_mean:+8.4f} "
+            f"{result.confidence_mean:7.4f} {result.threshold_mean:7.4f} "
+            f"{result.entries:7d} {result.latency_p99_us:8.1f} {check:>6}"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; non-zero means an invariant or determinism failure."""
     parser = argparse.ArgumentParser(
         prog="bench.scenario_audit",
-        description="Audit four deterministic tick-by-tick market scenarios.",
+        description="Audit directional plus multiple noise/random tick patterns.",
     )
     parser.add_argument("--count", type=int, default=600, help="ticks per scenario")
     parser.add_argument("--seed", type=int, default=20_260_726, help="scenario seed")
@@ -482,11 +541,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"count must be greater than {_WARMUP_CUTOFF}", file=sys.stderr)
         return 2
 
-    print("Snapshot Quant V4 deterministic scenario audit")
+    print("Snapshot Quant V4 deterministic multi-pattern scenario audit")
     print("Synthetic software fixtures only; this is not a backtest or return estimate.")
     results = run(args.count, args.seed)
     for result in results:
         print_result(result)
+    print_comparison(results)
     failures = sum(len(result.violations) for result in results)
     print(f"\nOVERALL: {'PASS' if failures == 0 else 'FAIL'} ({failures} violations)")
     return 0 if failures == 0 else 1

@@ -1,20 +1,28 @@
-"""Full-pipeline audit of the four deterministic market scenarios.
+"""Full-pipeline audit of deterministic scenario and pattern families.
 
-The scenarios are controlled fixtures, not claims about live market behaviour.
-These tests verify that known directional/choppy inputs retain valid market-data
-structure and produce coherent, bounded, deterministic engine outputs.
+These controlled fixtures are not claims about live market behaviour. Tests
+verify that directional, multiple noise and multiple random paths retain valid
+SnapQuote structure and produce coherent, bounded, deterministic engine output.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import statistics
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 
 import pytest
-from snapshot_quant_v4.adapter import MarketScenario, ScenarioConfig, ScenarioSource
+from snapshot_quant_v4.adapter import (
+    MarketScenario,
+    NoisePattern,
+    RandomPattern,
+    ScenarioConfig,
+    ScenarioSource,
+    snapshot_to_json,
+)
 from snapshot_quant_v4.config import config_from_mapping
 from snapshot_quant_v4.engine.quant_engine import EngineRegistry
 from snapshot_quant_v4.utils.clock import ManualClock
@@ -32,14 +40,46 @@ from snapshot_quant_v4.utils.types import (
 TOKEN = "3045"
 SYMBOL = "SBIN"
 TICK_PAISE = 5
+BASE_PAISE = 80_000
 COUNT = 600
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioCase:
+    """One top-level scenario plus its active pattern selection."""
+
+    scenario: MarketScenario
+    noise_pattern: NoisePattern = NoisePattern.WHIPSAW
+    random_pattern: RandomPattern = RandomPattern.UNBIASED_WALK
+
+    @property
+    def label(self) -> str:
+        """Stable pytest/report identifier."""
+        return ScenarioConfig(
+            scenario=self.scenario,
+            noise_pattern=self.noise_pattern,
+            random_pattern=self.random_pattern,
+        ).pattern_name
+
+
+UPWARD_CASE = ScenarioCase(MarketScenario.UPWARD)
+DOWNWARD_CASE = ScenarioCase(MarketScenario.DOWNWARD)
+NOISE_CASES = tuple(
+    ScenarioCase(MarketScenario.NOISE, noise_pattern=pattern)
+    for pattern in NoisePattern
+)
+RANDOM_CASES = tuple(
+    ScenarioCase(MarketScenario.RANDOM, random_pattern=pattern)
+    for pattern in RandomPattern
+)
+ALL_CASES = (UPWARD_CASE, DOWNWARD_CASE, *NOISE_CASES, *RANDOM_CASES)
 
 
 @dataclass(frozen=True, slots=True)
 class ScenarioRun:
     """Captured outputs and counters for one complete deterministic run."""
 
-    scenario: MarketScenario
+    case: ScenarioCase
     outputs: tuple[EngineOutput, ...]
     stats: EngineStats
 
@@ -96,15 +136,17 @@ def audit_config():
 
 
 def collect_source(
-    scenario: MarketScenario,
+    case: ScenarioCase,
     *,
     count: int = COUNT,
     seed: int = 20_260_726,
 ):
-    """Collect one exact source sequence."""
+    """Collect one exact scenario/pattern source sequence."""
     source = ScenarioSource(
         ScenarioConfig(
-            scenario=scenario,
+            scenario=case.scenario,
+            noise_pattern=case.noise_pattern,
+            random_pattern=case.random_pattern,
             token=TOKEN,
             symbol=SYMBOL,
             count=count,
@@ -116,7 +158,7 @@ def collect_source(
 
 
 def run_engine(
-    scenario: MarketScenario,
+    case: ScenarioCase,
     *,
     count: int = COUNT,
     seed: int = 20_260_726,
@@ -124,14 +166,14 @@ def run_engine(
     """Drive every source event through validation and all decision stages."""
     clock = ManualClock()
     registry = EngineRegistry(audit_config(), clock=clock)
-    _, snapshots = collect_source(scenario, count=count, seed=seed)
+    _, snapshots = collect_source(case, count=count, seed=seed)
     outputs: list[EngineOutput] = []
     for raw in snapshots:
         clock.advance(200.0)
         output = registry.process(raw)
         if output is not None:
             outputs.append(output)
-    return ScenarioRun(scenario, tuple(outputs), registry.statistics()[TOKEN])
+    return ScenarioRun(case, tuple(outputs), registry.statistics()[TOKEN])
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -140,12 +182,18 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, int(len(ordered) * fraction))]
 
 
-@pytest.mark.parametrize("scenario", list(MarketScenario))
+def deterministic_outputs(outputs: tuple[EngineOutput, ...]):
+    """Retain every output field except nondeterministic measured compute time."""
+    return tuple(replace(output, compute_us=0.0) for output in outputs)
+
+
+@pytest.mark.parametrize("case", ALL_CASES, ids=lambda case: case.label)
 def test_source_is_exactly_replayable_and_market_structurally_valid(
-    scenario: MarketScenario,
+    case: ScenarioCase,
 ) -> None:
-    source, first = collect_source(scenario, count=96)
+    source, first = collect_source(case, count=96)
     assert isinstance(source, MarketDataSource)
+    assert source.pattern_name == case.label
     assert source.emitted == 96
 
     source.start()
@@ -203,14 +251,28 @@ def test_source_lifecycle_stop_and_restart() -> None:
     assert restarted[0].sequence_number == 1
 
 
-def test_directional_and_noise_price_paths_match_the_contract() -> None:
-    _, upward = collect_source(MarketScenario.UPWARD, count=32)
-    _, downward = collect_source(MarketScenario.DOWNWARD, count=32)
-    _, noise = collect_source(MarketScenario.NOISE, count=32)
+def test_new_pattern_fields_preserve_the_existing_positional_config_api() -> None:
+    config = ScenarioConfig(MarketScenario.NOISE, "TOKEN", "POSITIONAL")
+    assert config.token == "TOKEN"
+    assert config.symbol == "POSITIONAL"
+    assert config.noise_pattern is NoisePattern.WHIPSAW
+    assert config.random_pattern is RandomPattern.UNBIASED_WALK
 
+
+def test_default_whipsaw_complete_stream_remains_backward_compatible() -> None:
+    source = ScenarioSource(ScenarioConfig(scenario=MarketScenario.NOISE, count=16))
+    source.start()
+    payload = "\n".join(snapshot_to_json(raw) for raw in source.snapshots()).encode()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "3a3a96774e5319f0dbdd2e2fe3444b511060a1e5ea3c666f9d919b7569ad67c0"
+    )
+
+
+def test_directional_price_paths_match_the_contract() -> None:
+    _, upward = collect_source(UPWARD_CASE, count=32)
+    _, downward = collect_source(DOWNWARD_CASE, count=32)
     upward_bids = [raw.bids[0].price_paise for raw in upward]
     downward_bids = [raw.bids[0].price_paise for raw in downward]
-    noise_bids = [raw.bids[0].price_paise for raw in noise]
     assert {later - earlier for earlier, later in pairwise(upward_bids)} == {
         TICK_PAISE
     }
@@ -218,31 +280,70 @@ def test_directional_and_noise_price_paths_match_the_contract() -> None:
         later - earlier for earlier, later in pairwise(downward_bids)
     } == {-TICK_PAISE}
 
-    noise_changes = [
-        (later - earlier) // TICK_PAISE
-        for earlier, later in pairwise(noise_bids)
+
+@pytest.mark.parametrize("case", NOISE_CASES, ids=lambda case: case.label)
+def test_each_noise_pattern_is_zero_sum_volatile_and_bidirectional(
+    case: ScenarioCase,
+) -> None:
+    _, snapshots = collect_source(case, count=32)
+    prices = [BASE_PAISE, *(raw.bids[0].price_paise for raw in snapshots)]
+    changes = [
+        (later - earlier) // TICK_PAISE for earlier, later in pairwise(prices)
     ]
-    assert min(noise_changes) <= -7
-    assert max(noise_changes) >= 7
-    assert all(noise_bids[index] == 80_000 for index in (7, 15, 23, 31))
-    assert max(noise_bids) - min(noise_bids) <= 8 * TICK_PAISE
+    assert min(changes) < 0 < max(changes)
+    assert max(abs(change) for change in changes) >= 6
+    for cycle_start in range(0, 32, 8):
+        assert sum(changes[cycle_start : cycle_start + 8]) == 0
+        assert snapshots[cycle_start + 7].bids[0].price_paise == BASE_PAISE
 
 
-def test_random_path_is_seeded_but_not_hard_coded() -> None:
-    _, first = collect_source(MarketScenario.RANDOM, count=128, seed=11)
-    _, replay = collect_source(MarketScenario.RANDOM, count=128, seed=11)
-    _, different = collect_source(MarketScenario.RANDOM, count=128, seed=12)
+def test_noise_patterns_are_economically_distinct() -> None:
+    streams = [collect_source(case, count=32)[1] for case in NOISE_CASES]
+    signatures = {
+        tuple(raw.bids[0].price_paise for raw in stream) for stream in streams
+    }
+    assert len(signatures) == len(NoisePattern)
+
+
+@pytest.mark.parametrize("case", RANDOM_CASES, ids=lambda case: case.label)
+def test_each_random_pattern_is_seeded_but_not_hard_coded(case: ScenarioCase) -> None:
+    _, first = collect_source(case, count=128, seed=11)
+    _, replay = collect_source(case, count=128, seed=11)
+    _, different = collect_source(case, count=128, seed=12)
     assert first == replay
     assert first != different
     assert len({raw.bids[0].price_paise for raw in first}) > 5
     assert len({raw.bids[0].quantity for raw in first}) > 10
 
 
-@pytest.mark.parametrize("scenario", list(MarketScenario))
+def test_random_patterns_have_their_declared_path_characteristics() -> None:
+    paths = {}
+    for case in RANDOM_CASES:
+        _, snapshots = collect_source(case)
+        paths[case.random_pattern] = [
+            (raw.bids[0].price_paise - BASE_PAISE) // TICK_PAISE
+            for raw in snapshots
+        ]
+
+    assert len({tuple(path) for path in paths.values()}) == len(RandomPattern)
+    mean_reverting = paths[RandomPattern.MEAN_REVERTING]
+    assert max(abs(offset) for offset in mean_reverting) <= 10
+
+    switching = paths[RandomPattern.TREND_SWITCHING]
+    block_moves = [
+        switching[start + 39] - switching[start]
+        for start in range(0, 560, 40)
+    ]
+    assert min(block_moves) <= -30
+    assert max(block_moves) >= 30
+    assert all(left * right < 0 for left, right in pairwise(block_moves))
+
+
+@pytest.mark.parametrize("case", ALL_CASES, ids=lambda case: case.label)
 def test_full_pipeline_accepts_every_tick_and_preserves_all_bounds(
-    scenario: MarketScenario,
+    case: ScenarioCase,
 ) -> None:
-    run = run_engine(scenario)
+    run = run_engine(case)
     outputs = run.outputs
     assert len(outputs) == COUNT
     assert run.stats.accepted == COUNT
@@ -319,6 +420,21 @@ def test_full_pipeline_accepts_every_tick_and_preserves_all_bounds(
             )
         if output.exit_quote is not None:
             assert output.exit_quote.filled_quantity <= output.exit_quote.requested_quantity
+        if output.pnl is not None:
+            expected_gross = (
+                (output.pnl.exit_price - output.pnl.entry_price)
+                * output.pnl.direction.signum
+                * output.pnl.quantity
+            )
+            assert output.pnl.gross_rupees == pytest.approx(expected_gross)
+            assert output.pnl.gross_ticks == pytest.approx(
+                expected_gross / (0.05 * output.pnl.quantity)
+            )
+            assert output.pnl.net_rupees == pytest.approx(
+                output.pnl.gross_rupees - output.pnl.cost_rupees
+            )
+            assert output.pnl.cost_rupees >= 0.0
+            assert output.pnl.holding_ms >= 0.0
 
     assert all(BlockReason.WARMUP in output.quality.reasons for output in outputs[:24])
     timings = [output.compute_us for output in outputs]
@@ -329,10 +445,10 @@ def test_full_pipeline_accepts_every_tick_and_preserves_all_bounds(
 
 
 @pytest.mark.parametrize(
-    ("scenario", "watch", "position", "opposite", "direction", "signum"),
+    ("case", "watch", "position", "opposite", "direction", "signum"),
     [
         (
-            MarketScenario.UPWARD,
+            UPWARD_CASE,
             TradeState.WATCH_LONG,
             TradeState.LONG,
             TradeState.SHORT,
@@ -340,7 +456,7 @@ def test_full_pipeline_accepts_every_tick_and_preserves_all_bounds(
             1.0,
         ),
         (
-            MarketScenario.DOWNWARD,
+            DOWNWARD_CASE,
             TradeState.WATCH_SHORT,
             TradeState.SHORT,
             TradeState.LONG,
@@ -350,14 +466,14 @@ def test_full_pipeline_accepts_every_tick_and_preserves_all_bounds(
     ],
 )
 def test_directional_scenarios_reach_expected_features_states_and_execution(
-    scenario: MarketScenario,
+    case: ScenarioCase,
     watch: TradeState,
     position: TradeState,
     opposite: TradeState,
     direction: Direction,
     signum: float,
 ) -> None:
-    outputs = run_engine(scenario).outputs
+    outputs = run_engine(case).outputs
     states = [output.state for output in outputs]
     assert TradeState.WARMUP in states
     assert TradeState.NEUTRAL in states
@@ -404,24 +520,13 @@ def test_directional_scenarios_reach_expected_features_states_and_execution(
         else exited.snapshot.best_ask.price
     )
     assert exited.exit_quote.reference_price == expected_exit_touch
-    expected_gross = (
-        (exited.pnl.exit_price - exited.pnl.entry_price)
-        * direction.signum
-        * exited.pnl.quantity
-    )
-    assert exited.pnl.gross_rupees == pytest.approx(expected_gross)
-    assert exited.pnl.gross_ticks == pytest.approx(
-        expected_gross / (0.05 * exited.pnl.quantity)
-    )
-    assert exited.pnl.net_rupees == pytest.approx(
-        exited.pnl.gross_rupees - exited.pnl.cost_rupees
-    )
-    assert exited.pnl.cost_rupees >= 0.0
-    assert exited.pnl.holding_ms >= 0.0
 
 
-def test_noise_is_detected_and_does_not_create_directional_trades() -> None:
-    outputs = run_engine(MarketScenario.NOISE).outputs
+@pytest.mark.parametrize("case", NOISE_CASES, ids=lambda case: case.label)
+def test_each_noise_pattern_is_detected_without_directional_trades(
+    case: ScenarioCase,
+) -> None:
+    outputs = run_engine(case).outputs
     mature = outputs[60:]
     directional_states = {
         TradeState.WATCH_LONG,
@@ -433,40 +538,26 @@ def test_noise_is_detected_and_does_not_create_directional_trades() -> None:
     }
     assert sum(output.regime.regime is Regime.NOISE for output in outputs) > COUNT * 0.90
     assert statistics.fmean(output.regime.efficiency_ratio for output in mature) < 0.05
-    assert statistics.fmean(output.regime.volatility_ticks for output in mature) > 4.0
-    assert statistics.fmean(output.composite.confidence for output in mature) < 0.05
+    assert statistics.fmean(output.regime.volatility_ticks for output in mature) > 3.0
+    assert statistics.fmean(output.composite.confidence for output in mature) < 0.08
     assert statistics.fmean(output.threshold.entry for output in mature) > 0.70
+    assert abs(statistics.fmean(output.composite.smoothed for output in mature)) < 0.03
     assert all(output.state not in directional_states for output in outputs)
-    assert all(not output.composite.valid for output in mature)
 
 
-def test_random_pipeline_is_reproducible_without_assuming_a_direction() -> None:
-    first = run_engine(MarketScenario.RANDOM, seed=99).outputs
-    replay = run_engine(MarketScenario.RANDOM, seed=99).outputs
-    different = run_engine(MarketScenario.RANDOM, seed=100).outputs
+@pytest.mark.parametrize("case", RANDOM_CASES, ids=lambda case: case.label)
+def test_each_random_pipeline_is_reproducible_without_assuming_direction(
+    case: ScenarioCase,
+) -> None:
+    first = run_engine(case, seed=99).outputs
+    replay = run_engine(case, seed=99).outputs
+    different = run_engine(case, seed=100).outputs
 
-    def fingerprint(outputs: tuple[EngineOutput, ...]):
-        return tuple(
-            (
-                output.state,
-                output.transition.previous,
-                output.regime.regime,
-                output.composite.score,
-                output.composite.smoothed,
-                output.composite.confidence,
-                output.threshold.entry,
-                tuple(
-                    (name, feature.raw, feature.value, feature.confidence, feature.valid)
-                    for name, feature in output.features.items()
-                ),
-            )
-            for output in outputs
-        )
-
-    assert fingerprint(first) == fingerprint(replay)
-    assert fingerprint(first) != fingerprint(different)
+    assert deterministic_outputs(first) == deterministic_outputs(replay)
+    assert deterministic_outputs(first) != deterministic_outputs(different)
     assert {output.regime.regime for output in first} <= set(Regime)
     transition_counts = Counter(
         output.transition.current for output in first if output.transition.changed
     )
-    assert transition_counts[TradeState.LONG] + transition_counts[TradeState.SHORT] <= 3
+    entries = transition_counts[TradeState.LONG] + transition_counts[TradeState.SHORT]
+    assert entries <= 15

@@ -14,8 +14,8 @@ engine are written against the protocol and never against a specific transport:
     Seeded synthetic book, for demonstrations and benchmarks. Explicitly not
     market data.
 ``ScenarioSource``
-    Four named, exactly reproducible tick-by-tick audit streams: upward,
-    downward, noise and random. Also explicitly not market data.
+    Exactly reproducible upward/downward streams plus three noise and three
+    seeded random pattern families. Also explicitly not market data.
 
 ``SnapshotRecorder`` writes the engine's normalised snapshot form, which is what
 ``ReplaySource`` consumes.
@@ -27,7 +27,13 @@ from .angel_v2 import AdapterUnavailableError, AngelOneAdapter, LoginError
 from .parsing import PayloadError, parse_snapshot, snapshot_from_json, snapshot_to_json
 from .queueing import SnapshotQueue
 from .replay import ReplaySource, SnapshotRecorder
-from .scenarios import MarketScenario, ScenarioConfig, ScenarioSource
+from .scenarios import (
+    MarketScenario,
+    NoisePattern,
+    RandomPattern,
+    ScenarioConfig,
+    ScenarioSource,
+)
 from .synthetic import SyntheticConfig, SyntheticSource
 
 __all__ = [
@@ -35,7 +41,9 @@ __all__ = [
     "AngelOneAdapter",
     "LoginError",
     "MarketScenario",
+    "NoisePattern",
     "PayloadError",
+    "RandomPattern",
     "ReplaySource",
     "ScenarioConfig",
     "ScenarioSource",
