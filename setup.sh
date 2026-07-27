@@ -1112,7 +1112,10 @@ EOF
 
 VERIFY_DIR="${WORK_DIR}/verify-units"
 FINAL_DIR="${WORK_DIR}/final-units"
-VERIFY_SESSION="${WORK_DIR}/session-check"
+# Some hardened VPS images mount /run with noexec. systemd-analyze checks
+# ExecCondition executability, so stage the temporary helper under /opt beside
+# the candidate release rather than in the noexec-capable work directory.
+VERIFY_SESSION="${CANDIDATE_DIR}/.install-session-check"
 make_session_check "${VERIFY_SESSION}"
 make_session_check "${FINAL_DIR}/session-check"
 make_service_unit "${VERIFY_DIR}/${SERVICE_NAME}.service" "${CANDIDATE_DIR}" \
@@ -1134,6 +1137,7 @@ systemd-analyze verify \
     "${VERIFY_DIR}/${SERVICE_NAME}-start.timer" \
     "${VERIFY_DIR}/${SERVICE_NAME}-stop.service" \
     "${VERIFY_DIR}/${SERVICE_NAME}-stop.timer"
+rm -f -- "${VERIFY_SESSION}"
 
 log "running the no-network live preflight and 20-snapshot smoke test inside the systemd sandbox"
 SMOKE_CONFIG="${CONFIG_DIR}/.candidate-${release_id}.json"
