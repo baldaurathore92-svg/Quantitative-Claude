@@ -788,7 +788,13 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1
 "${CANDIDATE_DIR}/.venv/bin/python" -m pip install --quiet \
     --no-deps --no-build-isolation "${CANDIDATE_DIR}"
 chown -R root:root "${CANDIDATE_DIR}"
-chmod -R go-w "${CANDIDATE_DIR}"
+# The installer keeps umask 0077 to protect credentials. venv/pip therefore
+# create private directories unless runtime access is normalized explicitly.
+# Candidate releases contain only allowlisted source and pinned dependencies;
+# no credentials are stored below /opt.
+chmod -R u=rwX,go=rX "${CANDIDATE_DIR}"
+runuser -u "${SERVICE_USER}" -- test -x "${CANDIDATE_DIR}/.venv/bin/python" \
+    || fail "service account cannot execute the candidate Python runtime"
 
 CANONICAL_ENV="${WORK_DIR}/credentials.env"
 CANDIDATE_CONFIG="${WORK_DIR}/config.json"
