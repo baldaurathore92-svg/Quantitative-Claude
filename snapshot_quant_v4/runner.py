@@ -46,9 +46,17 @@ from .config import AppConfig
 from .engine.quant_engine import EngineRegistry
 from .utils.clock import Clock, SystemClock
 from .utils.logging_utils import get_logger
-from .utils.types import EngineOutput, MarketDataSource, RawSnapshot, Renderer
+from .utils.types import (
+    Direction,
+    EngineOutput,
+    MarketDataSource,
+    RawSnapshot,
+    Renderer,
+)
 
 _LOGGER = get_logger(__name__)
+
+_MIN_LIVE_STATUS_INTERVAL_MS = 5_000.0
 
 
 class LatencyTracker:
@@ -120,6 +128,9 @@ class EngineRunner:
         Whether to install ``SIGINT``/``SIGTERM`` handlers. Disabled by tests and
         by embedded use, since handlers are process-global state and can only be
         installed from the main thread.
+    live_status:
+        Emit rate-limited current-price and model-signal records. Intended for a
+        live headless process whose renderer cannot expose in-memory state.
     """
 
     __slots__ = (
@@ -129,12 +140,14 @@ class EngineRunner:
         "_latency",
         "_latest",
         "_latest_lock",
+        "_live_status",
         "_recorder",
         "_registry",
         "_render_thread",
         "_renderer",
         "_source",
         "_stats",
+        "_status_thread",
         "_stop",
     )
 
@@ -148,6 +161,7 @@ class EngineRunner:
         clock: Clock | None = None,
         recorder: SnapshotRecorder | None = None,
         install_signal_handlers: bool = True,
+        live_status: bool = False,
     ) -> None:
         self._config = config
         self._source = source
@@ -156,12 +170,14 @@ class EngineRunner:
         self._clock = clock if clock is not None else SystemClock()
         self._recorder = recorder
         self._install_signals = install_signal_handlers
+        self._live_status = live_status
         self._stop = threading.Event()
         self._latest: dict[str, EngineOutput] = {}
         self._latest_lock = threading.Lock()
         self._latency = LatencyTracker(config.runtime.latency_window)
         self._stats = RunnerStats()
         self._render_thread: threading.Thread | None = None
+        self._status_thread: threading.Thread | None = None
 
     # -- introspection ----------------------------------------------------- #
 
@@ -189,6 +205,7 @@ class EngineRunner:
             self._source.start()
             self._renderer.start()
             self._start_render_thread()
+            self._start_status_thread()
             self._consume()
         finally:
             self._stop.set()
@@ -300,6 +317,125 @@ class EngineRunner:
             metrics.append(f"parse-errors {errors}")
         return metrics
 
+    # -- live headless status --------------------------------------------- #
+
+    def _status_interval_s(self) -> float:
+        """Return the configured interval with a log-safety lower bound."""
+        effective_ms = max(
+            self._config.runtime.stats_interval_ms,
+            _MIN_LIVE_STATUS_INTERVAL_MS,
+        )
+        return effective_ms / 1000.0
+
+    def _start_status_thread(self) -> None:
+        """Start rate-limited journal status output for a live headless run."""
+        if not self._live_status:
+            return
+        interval_s = self._status_interval_s()
+        _LOGGER.info(
+            "live model status enabled every %.1fs; BUY/SELL means the current "
+            "model position bias, WAIT means the model is flat, and no broker "
+            "orders are placed",
+            interval_s,
+        )
+        thread = threading.Thread(
+            target=self._status_loop,
+            name="live-status",
+            daemon=True,
+        )
+        self._status_thread = thread
+        thread.start()
+
+    def _status_loop(self) -> None:
+        """Publish one current-state record per configured symbol periodically."""
+        interval_s = self._status_interval_s()
+        while not self._stop.wait(interval_s):
+            self._log_current_status(event="periodic")
+
+    def _log_current_status(self, *, event: str) -> None:
+        """Take one coherent latest-output snapshot and publish every symbol."""
+        with self._latest_lock:
+            latest = dict(self._latest)
+        for symbol in self._config.symbols:
+            current = latest.get(symbol.token)
+            if current is None:
+                self._log_waiting_symbol(symbol.symbol, symbol.token, event=event)
+            else:
+                self._log_status_output(current, event=event)
+
+    @staticmethod
+    def _model_signal(output: EngineOutput) -> tuple[str, str]:
+        """Return the current model-position bias, never an order instruction."""
+        position = output.position
+        if position is not None and position.is_open:
+            if position.direction is Direction.LONG:
+                return "BUY", "POSITION"
+            if position.direction is Direction.SHORT:
+                return "SELL", "POSITION"
+        return "WAIT", "FLAT"
+
+    def _log_waiting_symbol(self, symbol: str, token: str, *, event: str) -> None:
+        """Keep configured symbols visible even before their first good tick."""
+        _LOGGER.warning(
+            "LIVE STATUS event=%s symbol=%s token=%s ltp=n/a "
+            "model_signal=WAIT signal_type=NO_DATA state=NO_DATA position=FLAT "
+            "score=n/a confidence=0%% quality=NO_ACCEPTED_SNAPSHOT "
+            "snapshot_index=0 exchange_ms=0 data_age=n/a processed=%d",
+            event,
+            symbol,
+            token,
+            self._stats.processed,
+        )
+
+    def _log_status_output(self, output: EngineOutput, *, event: str) -> None:
+        """Log one immutable engine output without changing decision state."""
+        position = output.position
+        if position is not None and position.is_open:
+            position_text = (
+                f"{position.direction.name}:{position.quantity}@{position.entry_price:.2f}"
+            )
+        else:
+            position_text = "FLAT"
+        quality = (
+            "OK"
+            if output.quality.tradable
+            else "+".join(reason.value for reason in output.quality.reasons)
+        )
+        score = (
+            f"{output.composite.smoothed:+.3f}"
+            if output.composite.valid
+            else "n/a"
+        )
+        model_signal, signal_type = self._model_signal(output)
+        data_age_s = max(
+            0.0,
+            (
+                self._clock.monotonic_ms()
+                - output.snapshot.received_monotonic_ms
+            )
+            / 1000.0,
+        )
+        _LOGGER.info(
+            "LIVE STATUS event=%s symbol=%s token=%s ltp=%.2f "
+            "model_signal=%s signal_type=%s state=%s position=%s score=%s "
+            "confidence=%.0f%% quality=%s snapshot_index=%d exchange_ms=%d "
+            "data_age=%.1fs",
+            event,
+            output.symbol,
+            output.token,
+            output.snapshot.last_traded_price,
+            model_signal,
+            signal_type,
+            output.state.value,
+            position_text,
+            score,
+            output.composite.confidence * 100.0,
+            quality,
+            output.snapshot_index,
+            output.exchange_timestamp_ms,
+            data_age_s,
+        )
+
     # -- shutdown ---------------------------------------------------------- #
 
     def _install_handlers(self) -> Mapping[int, Any] | None:
@@ -328,6 +464,15 @@ class EngineRunner:
             self._source.stop()
         except Exception:
             _LOGGER.exception("error stopping source")
+
+        status_thread = self._status_thread
+        if status_thread is not None and status_thread.is_alive():
+            # The monitor only performs bounded QueueHandler writes, so waiting
+            # for it guarantees no periodic record can follow the final snapshot.
+            status_thread.join()
+        self._status_thread = None
+        if self._live_status:
+            self._log_current_status(event="shutdown")
 
         thread = self._render_thread
         if thread is not None and thread.is_alive():

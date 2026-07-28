@@ -244,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             renderer,
             clock=clock,
             recorder=recorder,
+            live_status=args.mode == "live" and config.runtime.renderer == "none",
         )
         runner.run()
         for line in runner.summary_lines():
