@@ -112,6 +112,49 @@ class TestDepthWalk:
         assert not quote.complete
         assert quote.filled_quantity == 20
 
+    def test_partial_fill_policy_blocks_entry_before_and_during_open(self) -> None:
+        execution = model(
+            use_depth_walk=True,
+            allow_partial_fill=False,
+            entry_aggression_ticks=0.0,
+        )
+        snapshot = validate_one(
+            make_snapshot(asks=ladder(BASE_PAISE + TICK_PAISE, TICK_PAISE, (10, 10)))
+        )
+        allowed, detail = execution.entry_is_fillable(
+            snapshot,
+            Direction.LONG,
+            500,
+        )
+        assert not allowed
+        assert "available 20" in detail
+        with pytest.raises(ValueError, match="partial entry fill is disabled"):
+            execution.open_position(
+                snapshot,
+                Direction.LONG,
+                500,
+                monotonic_ms=0.0,
+            )
+
+    def test_allowed_partial_fill_opens_only_the_executed_quantity(self) -> None:
+        execution = model(
+            use_depth_walk=True,
+            allow_partial_fill=True,
+            entry_aggression_ticks=0.0,
+        )
+        snapshot = validate_one(
+            make_snapshot(asks=ladder(BASE_PAISE + TICK_PAISE, TICK_PAISE, (10, 10)))
+        )
+        position = execution.open_position(
+            snapshot,
+            Direction.LONG,
+            500,
+            monotonic_ms=0.0,
+        )
+        assert position.quantity == 20
+        assert not position.entry_quote.complete
+        assert position.entry_quote.requested_quantity == 500
+
     def test_touch_fill_ignores_size(self) -> None:
         execution = model(use_depth_walk=False, entry_aggression_ticks=0.0)
         snapshot = validate_one(
@@ -156,6 +199,91 @@ class TestPositionsAndPnL:
         assert report.cost_rupees == 0.0
         assert report.net_rupees == pytest.approx(report.gross_rupees)
         assert report.holding_ms == pytest.approx(2_500.0)
+
+    def test_partial_exit_pnl_is_limited_to_the_executable_quantity(self) -> None:
+        execution = model(
+            use_depth_walk=True,
+            entry_aggression_ticks=0.0,
+            exit_slippage_ticks=0.0,
+        )
+        entry_snapshot = validate_one(make_snapshot())
+        position = execution.open_position(
+            entry_snapshot,
+            Direction.LONG,
+            500,
+            monotonic_ms=0.0,
+        )
+        thin_exit = validate_one(
+            make_snapshot(
+                bids=ladder(
+                    BASE_PAISE - TICK_PAISE,
+                    -TICK_PAISE,
+                    (10, 10),
+                )
+            )
+        )
+        quote, report = execution.mark_to_market(
+            position,
+            thin_exit,
+            monotonic_ms=100.0,
+        )
+        assert not quote.complete
+        assert quote.filled_quantity == 20
+        assert report.quantity == 20
+        assert report.gross_rupees == pytest.approx(
+            (quote.price - position.entry_price) * 20
+        )
+
+    def test_repeated_partial_exits_allocate_one_entry_order_cost(self) -> None:
+        execution = model(
+            use_depth_walk=True,
+            entry_aggression_ticks=0.0,
+            exit_slippage_ticks=0.0,
+            cost=CostConfig(enabled=True),
+        )
+        position = execution.open_position(
+            validate_one(make_snapshot()),
+            Direction.LONG,
+            500,
+            monotonic_ms=0.0,
+        )
+        original_entry_cost = position.remaining_entry_cost_rupees
+        thin_exit = validate_one(
+            make_snapshot(
+                bids=ladder(
+                    BASE_PAISE - TICK_PAISE,
+                    -TICK_PAISE,
+                    (10, 10),
+                )
+            )
+        )
+        total_reported_cost = 0.0
+        exit_price = 0.0
+        for index in range(25):
+            quote, report = execution.mark_to_market(
+                position,
+                thin_exit,
+                monotonic_ms=float(index),
+            )
+            assert quote.filled_quantity == 20
+            assert report.quantity == 20
+            total_reported_cost += report.cost_rupees
+            exit_price = quote.price
+            if quote.complete:
+                break
+            position = execution.residual_position(
+                position,
+                quote.filled_quantity,
+            )
+
+        expected_exit_cost = 25 * execution.costs.leg_cost(
+            price=exit_price,
+            quantity=20,
+            buying=False,
+        )
+        assert total_reported_cost == pytest.approx(
+            original_entry_cost + expected_exit_cost
+        )
 
     def test_short_pnl_has_the_opposite_sign(self) -> None:
         execution = model(entry_aggression_ticks=0.0, exit_slippage_ticks=0.0)

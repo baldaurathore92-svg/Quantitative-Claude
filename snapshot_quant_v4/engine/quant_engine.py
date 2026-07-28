@@ -494,7 +494,10 @@ class SymbolEngine:
         """
         reasons: list[str] = []
         if forced_flat:
-            reasons.append("! state reset after feed gap")
+            if self._state_machine.position is None:
+                reasons.append("! state reset after feed gap")
+            else:
+                reasons.append("! statistics reset; forced liquidation remains open")
 
         contributions = composite.contributions
         ranked = sorted(
@@ -519,12 +522,23 @@ class SymbolEngine:
             reasons.append(f"+ Spread compressing ({compression.raw:+.2f}t)")
 
         spread = features.get(F_SPREAD)
+        spread_limit_ticks = quality.spread_limit_ticks
+        if spread_limit_ticks is None:
+            spread_limit_ticks = self._config.quality.max_signal_spread_ticks
         if (
             spread is not None
             and spread.valid
-            and spread.raw > self._config.quality.max_signal_spread_ticks
+            and spread.raw > spread_limit_ticks
         ):
-            reasons.append(f"- Spread wide ({spread.raw:.2f}t)")
+            spread_bps = (
+                f"/{quality.spread_bps:.2f}bps"
+                if quality.spread_bps is not None
+                else ""
+            )
+            reasons.append(
+                f"- Spread wide ({spread.raw:.2f}t{spread_bps} > "
+                f"{spread_limit_ticks:.2f}t)"
+            )
 
         if self._stats.touch_stability >= _STABILITY_REASON_LEVEL:
             reasons.append(f"+ Queue stable ({self._stats.touch_stability:.2f})")

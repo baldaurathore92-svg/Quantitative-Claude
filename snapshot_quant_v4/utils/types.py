@@ -316,6 +316,8 @@ class QualityReport:
     book_quality: float
     liquidity_score: float
     detail: str = ""
+    spread_bps: float | None = None
+    spread_limit_ticks: float | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -484,7 +486,12 @@ class CostBreakdown:
 
 @dataclass(frozen=True, slots=True)
 class Position:
-    """An open modelled position."""
+    """An open modelled position.
+
+    ``remaining_entry_cost_rupees`` carries the unallocated cost of the original
+    entry order. Partial exits consume it pro rata, preventing each residual fill
+    from being charged as though it opened through a fresh entry order.
+    """
 
     direction: Direction
     quantity: int
@@ -494,6 +501,7 @@ class Position:
     entry_quote: FillQuote
     stop_price: float
     target_price: float
+    remaining_entry_cost_rupees: float = 0.0
 
     @property
     def is_open(self) -> bool:

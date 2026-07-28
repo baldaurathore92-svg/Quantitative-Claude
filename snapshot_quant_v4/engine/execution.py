@@ -36,7 +36,7 @@ they differ per broker and change with regulation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..config import CostConfig, ExecutionConfig, StateMachineConfig
 from ..utils.math_utils import (
@@ -93,6 +93,28 @@ class CostModel:
         """Whether costs are being modelled at all."""
         return self._config.enabled
 
+    def leg_cost(self, *, price: float, quantity: int, buying: bool) -> float:
+        """Cost in rupees for one buy or sell order leg.
+
+        This is used to allocate one original entry order across partial exits
+        while charging each exit fill as its own order. Summing one buy and one
+        sell leg is exactly equivalent to :meth:`round_trip`.
+        """
+        config = self._config
+        if not config.enabled or quantity <= 0:
+            return 0.0
+        turnover = price * quantity
+        brokerage = self._brokerage(turnover)
+        exchange = config.exchange_txn_rate * turnover
+        sebi = config.sebi_rate * turnover
+        statutory = (
+            config.stamp_duty_buy_rate * turnover
+            if buying
+            else config.stt_sell_rate * turnover
+        )
+        gst = config.gst_rate * (brokerage + exchange + sebi)
+        return brokerage + exchange + sebi + statutory + gst
+
     def round_trip(
         self,
         *,
@@ -126,7 +148,15 @@ class CostModel:
         gst = config.gst_rate * (brokerage + exchange + sebi)
 
         reference = (buy_turnover + sell_turnover) * 0.5
-        rupees = brokerage + exchange + sebi + statutory + gst
+        rupees = self.leg_cost(
+            price=buy_price,
+            quantity=quantity,
+            buying=True,
+        ) + self.leg_cost(
+            price=sell_price,
+            quantity=quantity,
+            buying=False,
+        )
         breakdown = CostBreakdown(
             brokerage_bps=self._as_bps(brokerage + gst, reference),
             exchange_bps=self._as_bps(exchange + sebi, reference),
@@ -328,21 +358,34 @@ class ExecutionModel:
         position rather than being recomputed from a moving reference.
         """
         quote = self.entry_quote(snapshot, direction, quantity)
+        if quote.filled_quantity <= 0:
+            raise ValueError("entry order has no executable visible depth")
+        if not quote.complete and not self._config.allow_partial_fill:
+            raise ValueError(
+                "partial entry fill is disabled: "
+                f"requested {quote.requested_quantity}, visible {quote.filled_quantity}"
+            )
         tick = snapshot.tick_size
         stop_distance = self._state_machine.stop_ticks * tick
         target_distance = self._state_machine.target_ticks * tick
         signum = direction.signum
         stop_price = round_to_tick(quote.price - signum * stop_distance, tick)
         target_price = round_to_tick(quote.price + signum * target_distance, tick)
+        entry_cost = self._costs.leg_cost(
+            price=quote.price,
+            quantity=quote.filled_quantity,
+            buying=direction is Direction.LONG,
+        )
         return Position(
             direction=direction,
-            quantity=quote.filled_quantity if quote.filled_quantity > 0 else quantity,
+            quantity=quote.filled_quantity,
             entry_price=quote.price,
             entry_monotonic_ms=monotonic_ms,
             entry_exchange_ms=snapshot.exchange_timestamp_ms,
             entry_quote=quote,
             stop_price=stop_price,
             target_price=target_price,
+            remaining_entry_cost_rupees=entry_cost,
         )
 
     def mark_to_market(
@@ -351,42 +394,105 @@ class ExecutionModel:
         """Value an open position at the current book.
 
         Returns both the exit quote and the profit and loss report, so callers do
-        not have to recompute the quote to display the exit price.
+        not have to recompute the quote to display the exit price. When visible
+        depth is insufficient, the report is explicitly limited to the quote's
+        executable quantity; it never applies a partial quote to the full
+        position.
         """
         quote = self.exit_quote(snapshot, position.direction, position.quantity)
+        quantity = quote.filled_quantity
         signum = position.direction.signum
-        gross_rupees = (quote.price - position.entry_price) * signum * position.quantity
-        gross_ticks = safe_div(
-            (quote.price - position.entry_price) * signum, snapshot.tick_size
+        gross_rupees = (quote.price - position.entry_price) * signum * quantity
+        gross_ticks = (
+            safe_div(
+                (quote.price - position.entry_price) * signum,
+                snapshot.tick_size,
+            )
+            if quantity > 0
+            else 0.0
         )
 
-        if position.direction is Direction.LONG:
-            buy_price, sell_price = position.entry_price, quote.price
-        else:
-            buy_price, sell_price = quote.price, position.entry_price
-        cost = self._costs.round_trip(
-            buy_price=buy_price,
-            sell_price=sell_price,
-            quantity=position.quantity,
-            tick_size=snapshot.tick_size,
+        entry_cost = self._allocated_entry_cost(position, quantity)
+        exit_cost = self._costs.leg_cost(
+            price=quote.price,
+            quantity=quantity,
+            buying=position.direction is Direction.SHORT,
         )
-        net_rupees = gross_rupees - cost.rupees
-        reference_notional = position.entry_price * position.quantity
+        cost_rupees = entry_cost + exit_cost
+        net_rupees = gross_rupees - cost_rupees
+        reference_notional = position.entry_price * quantity
         report = PnLReport(
             direction=position.direction,
-            quantity=position.quantity,
+            quantity=quantity,
             entry_price=position.entry_price,
             exit_price=quote.price,
             gross_ticks=gross_ticks,
             gross_rupees=gross_rupees,
-            cost_rupees=cost.rupees,
+            cost_rupees=cost_rupees,
             net_rupees=net_rupees,
             net_bps=safe_div(net_rupees * 1e4, reference_notional),
             holding_ms=monotonic_ms - position.entry_monotonic_ms,
         )
         return quote, report
 
+    def residual_position(
+        self,
+        position: Position,
+        filled_quantity: int,
+    ) -> Position:
+        """Return the unfilled residual with entry cost allocated pro rata."""
+        if not 0 <= filled_quantity < position.quantity:
+            raise ValueError(
+                "filled_quantity must be non-negative and smaller than position size"
+            )
+        allocated = self._allocated_entry_cost(position, filled_quantity)
+        return replace(
+            position,
+            quantity=position.quantity - filled_quantity,
+            remaining_entry_cost_rupees=max(
+                0.0,
+                position.remaining_entry_cost_rupees - allocated,
+            ),
+        )
+
+    @staticmethod
+    def _allocated_entry_cost(position: Position, filled_quantity: int) -> float:
+        """Allocate the original entry order cost to one exit fill."""
+        if filled_quantity <= 0 or position.quantity <= 0:
+            return 0.0
+        if filled_quantity >= position.quantity:
+            return position.remaining_entry_cost_rupees
+        return (
+            position.remaining_entry_cost_rupees
+            * filled_quantity
+            / position.quantity
+        )
+
     # -- optional cost gate ------------------------------------------------ #
+
+    def entry_is_fillable(
+        self,
+        snapshot: Snapshot,
+        direction: Direction,
+        quantity: int,
+    ) -> tuple[bool, str]:
+        """Whether visible directional depth satisfies the entry-fill policy.
+
+        Touch-fill models always report complete execution. With depth walking,
+        an incomplete quote is allowed only when ``allow_partial_fill`` is true.
+        Keeping this separate from :meth:`clears_cost` preserves that method's
+        established two-argument override contract.
+        """
+        config = self._config
+        if not config.use_depth_walk or config.allow_partial_fill:
+            return True, ""
+        quote = self.entry_quote(snapshot, direction, quantity)
+        if quote.complete:
+            return True, ""
+        return False, (
+            "insufficient visible entry depth: "
+            f"requested {quote.requested_quantity}, available {quote.filled_quantity}"
+        )
 
     def clears_cost(self, snapshot: Snapshot, quantity: int) -> tuple[bool, str]:
         """Whether the configured target clears the round-trip cost.
@@ -394,8 +500,7 @@ class ExecutionModel:
         The comparison is between the configured target distance and the modelled
         round-trip cost, both converted to basis points of the entry notional, with
         a required safety multiple. A strategy whose target does not clear its own
-        costs by a margin is not a strategy, and this check makes that visible at
-        the point of entry rather than in the end-of-day total.
+        costs by a margin is blocked at the point of entry.
 
         Disabled by default; when disabled the method reports success without
         consulting the cost model at all.

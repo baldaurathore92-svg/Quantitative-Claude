@@ -1032,7 +1032,10 @@ class ExecutionConfig:
     trading: when enabled, entries are blocked unless the configured target
     clears the round-trip cost by ``min_edge_multiple``. It defaults to off so
     that the signal engine's behaviour is not implicitly coupled to a cost
-    assumption.
+    assumption. ``allow_partial_fill`` is enforced only with depth walking: when
+    false, an entry whose visible directional ladder cannot absorb the full
+    requested quantity is blocked before state transition and rejected by direct
+    execution callers.
     """
 
     entry_aggression_bps: float = 3.0

@@ -81,7 +81,8 @@ class MarketQualityFilter:
             reasons.append(BlockReason.WARMUP)
 
         spread_ticks = snapshot.spread_ticks
-        if spread_ticks > config.max_signal_spread_ticks:
+        spread_bps, spread_limit_ticks = self._spread_metrics(snapshot)
+        if spread_ticks > spread_limit_ticks:
             reasons.append(BlockReason.SPREAD_TOO_WIDE)
 
         bid_levels = self._usable_levels(snapshot, Side.BID)
@@ -103,6 +104,7 @@ class MarketQualityFilter:
         liquidity_score = self._liquidity_score(relative_depth)
         book_quality = self._book_quality(
             spread_ticks=spread_ticks,
+            spread_limit_ticks=spread_limit_ticks,
             usable_levels=min(bid_levels, ask_levels),
             liquidity_score=liquidity_score,
             stats=stats,
@@ -112,10 +114,23 @@ class MarketQualityFilter:
             reasons=tuple(reasons) if reasons else _NO_REASONS,
             book_quality=book_quality,
             liquidity_score=liquidity_score,
-            detail=self._describe(reasons, spread_ticks, relative_depth),
+            detail=self._describe(
+                reasons,
+                spread_ticks,
+                spread_bps,
+                spread_limit_ticks,
+                relative_depth,
+            ),
+            spread_bps=spread_bps,
+            spread_limit_ticks=spread_limit_ticks,
         )
 
     # -- components -------------------------------------------------------- #
+
+    def _spread_metrics(self, snapshot: Snapshot) -> tuple[float, float]:
+        """Return the observed spread in bps and the configured tick limit."""
+        spread_bps = snapshot.spread * 10_000.0 / snapshot.mid
+        return spread_bps, self._config.max_signal_spread_ticks
 
     def _usable_levels(self, snapshot: Snapshot, side: Side) -> int:
         """Count levels carrying both quantity and the required order count.
@@ -148,6 +163,7 @@ class MarketQualityFilter:
         self,
         *,
         spread_ticks: float,
+        spread_limit_ticks: float,
         usable_levels: int,
         liquidity_score: float,
         stats: SharedStatistics,
@@ -161,7 +177,7 @@ class MarketQualityFilter:
         """
         config = self._config
         spread_component = linear_scale(
-            -spread_ticks, -config.max_signal_spread_ticks, -1.0
+            -spread_ticks, -spread_limit_ticks, -1.0
         )
         level_component = linear_scale(
             float(usable_levels), float(config.min_depth_levels) - 1.0, 5.0
@@ -178,6 +194,8 @@ class MarketQualityFilter:
         self,
         reasons: list[BlockReason],
         spread_ticks: float,
+        spread_bps: float,
+        spread_limit_ticks: float,
         relative_depth: float,
     ) -> str:
         """Build a short operator-facing explanation."""
@@ -185,7 +203,8 @@ class MarketQualityFilter:
             return ""
         return (
             f"blocked={'+'.join(reason.value for reason in reasons)} "
-            f"spread={spread_ticks:.2f}t depth={relative_depth:.2f}x"
+            f"spread={spread_ticks:.2f}t/{spread_bps:.2f}bps "
+            f"limit={spread_limit_ticks:.2f}t depth={relative_depth:.2f}x"
         )
 
 

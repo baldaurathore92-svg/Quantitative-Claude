@@ -31,6 +31,7 @@ from conftest import (
     BASE_PAISE,
     TICK_PAISE,
     feature_value,
+    ladder,
     make_snapshot,
     quality_report,
     validate_one,
@@ -73,6 +74,7 @@ def build_machine(
     clock: ManualClock,
     state_config: StateMachineConfig | None = None,
     execution_config: ExecutionConfig | None = None,
+    quantity: int = 1,
 ) -> TradingStateMachine:
     """Construct a state machine with injected clock and execution model."""
     resolved_state = (
@@ -99,7 +101,13 @@ def build_machine(
         )
     )
     execution = ExecutionModel(resolved_execution, resolved_state)
-    return TradingStateMachine(resolved_state, LTP_CONFIG, execution, clock, quantity=1)
+    return TradingStateMachine(
+        resolved_state,
+        LTP_CONFIG,
+        execution,
+        clock,
+        quantity=quantity,
+    )
 
 
 def warm_up(machine: TradingStateMachine, snapshot) -> None:
@@ -489,6 +497,85 @@ class TestExit:
         assert output.state is TradeState.EXIT_LONG
         assert any("quality" in reason for reason in output.reasons)
 
+    def test_insufficient_depth_levels_is_a_critical_quality_exit(self) -> None:
+        clock = ManualClock()
+        machine = build_machine(clock=clock)
+        snapshot = validate_one(make_snapshot())
+        self._enter_long(clock, machine, snapshot)
+        output = machine.update(
+            snapshot=snapshot,
+            composite=composite(0.9),
+            threshold=thresholds(),
+            quality=quality_report(
+                tradable=False,
+                reasons=(BlockReason.INSUFFICIENT_DEPTH_LEVELS,),
+            ),
+            features=features(),
+        )
+        assert output.state is TradeState.EXIT_LONG
+        assert any("INSUFFICIENT_DEPTH_LEVELS" in reason for reason in output.reasons)
+
+    def test_critical_depth_exit_bypasses_hold_and_preserves_unfilled_residual(
+        self,
+    ) -> None:
+        clock = ManualClock()
+        machine = build_machine(
+            clock=clock,
+            state_config=StateMachineConfig(
+                entry_confirmations=1,
+                min_watch_confidence=0.2,
+                min_entry_confidence=0.5,
+                min_hold_ms=5_000.0,
+                max_hold_ms=60_000.0,
+            ),
+            execution_config=ExecutionConfig(
+                use_depth_walk=True,
+                entry_aggression_ticks=0.0,
+                exit_slippage_ticks=0.0,
+                cost=CostConfig(enabled=False),
+            ),
+            quantity=500,
+        )
+        snapshot = validate_one(make_snapshot())
+        self._enter_long(clock, machine, snapshot)
+        thin = validate_one(
+            make_snapshot(
+                bids=ladder(
+                    BASE_PAISE - TICK_PAISE,
+                    -TICK_PAISE,
+                    (10, 10),
+                )
+            )
+        )
+        output = machine.update(
+            snapshot=thin,
+            composite=composite(0.9),
+            threshold=thresholds(),
+            quality=quality_report(
+                tradable=False,
+                reasons=(BlockReason.INSUFFICIENT_DEPTH_LEVELS,),
+            ),
+            features=features(),
+        )
+        assert output.state is TradeState.LONG
+        assert output.position is not None and output.position.quantity == 480
+        assert output.exit_quote is not None and not output.exit_quote.complete
+        assert output.exit_quote.filled_quantity == 20
+        assert output.pnl is not None and output.pnl.quantity == 20
+        assert any("partial exit" in reason for reason in output.reasons)
+
+        completed = machine.update(
+            snapshot=snapshot,
+            composite=composite(0.9),
+            threshold=thresholds(),
+            quality=quality_report(),
+            features=features(),
+        )
+        assert completed.state is TradeState.EXIT_LONG
+        assert completed.position is None
+        assert completed.exit_quote is not None and completed.exit_quote.complete
+        assert completed.pnl is not None and completed.pnl.quantity == 480
+
     def test_minimum_hold_defers_a_soft_exit_but_not_a_stop(self) -> None:
         clock = ManualClock()
         machine = build_machine(
@@ -655,6 +742,62 @@ class TestForceFlat:
         assert output.pnl is not None
         assert output.exit_quote is not None
 
+    def test_force_flat_does_not_claim_flat_when_visible_exit_is_partial(self) -> None:
+        clock = ManualClock()
+        machine = build_machine(
+            clock=clock,
+            state_config=StateMachineConfig(
+                entry_confirmations=1,
+                min_watch_confidence=0.2,
+                min_entry_confidence=0.5,
+                exit_on_quality_loss=False,
+            ),
+            execution_config=ExecutionConfig(
+                use_depth_walk=True,
+                entry_aggression_ticks=0.0,
+                exit_slippage_ticks=0.0,
+                cost=CostConfig(enabled=False),
+            ),
+            quantity=500,
+        )
+        snapshot = validate_one(make_snapshot())
+        warm_up(machine, snapshot)
+        for _ in range(2):
+            machine.update(
+                snapshot=snapshot,
+                composite=composite(0.9),
+                threshold=thresholds(),
+                quality=quality_report(),
+                features=features(),
+            )
+        thin = validate_one(
+            make_snapshot(
+                bids=ladder(
+                    BASE_PAISE - TICK_PAISE,
+                    -TICK_PAISE,
+                    (10, 10),
+                )
+            )
+        )
+        output = machine.force_flat(thin, "feed gap")
+        assert output.state is TradeState.LONG
+        assert output.position is not None and output.position.quantity == 500
+        assert machine.position is output.position
+        assert output.pnl is None
+        assert output.exit_quote is not None and not output.exit_quote.complete
+        assert any("pending" in reason for reason in output.reasons)
+
+        completed = machine.update(
+            snapshot=snapshot,
+            composite=composite(0.9),
+            threshold=thresholds(),
+            quality=quality_report(),
+            features=features(),
+        )
+        assert completed.state is TradeState.WARMUP
+        assert completed.position is None
+        assert completed.pnl is not None and completed.pnl.quantity == 500
+
     def test_force_flat_without_a_position_is_safe(self) -> None:
         machine = build_machine(clock=ManualClock())
         snapshot = validate_one(make_snapshot())
@@ -664,6 +807,45 @@ class TestForceFlat:
 
 
 class TestCostGate:
+    def test_two_argument_clears_cost_override_remains_compatible(self) -> None:
+        class LegacyCostOverride(ExecutionModel):
+            def clears_cost(self, snapshot, quantity):
+                assert snapshot is not None
+                assert quantity == 1
+                return True, ""
+
+        clock = ManualClock()
+        state_config = StateMachineConfig(
+            entry_confirmations=1,
+            min_watch_confidence=0.2,
+            min_entry_confidence=0.5,
+        )
+        execution = LegacyCostOverride(ExecutionConfig(), state_config)
+        machine = TradingStateMachine(
+            state_config,
+            LTP_CONFIG,
+            execution,
+            clock,
+            quantity=1,
+        )
+        snapshot = validate_one(make_snapshot())
+        warm_up(machine, snapshot)
+        machine.update(
+            snapshot=snapshot,
+            composite=composite(0.9),
+            threshold=thresholds(),
+            quality=quality_report(),
+            features=features(),
+        )
+        entered = machine.update(
+            snapshot=snapshot,
+            composite=composite(0.9),
+            threshold=thresholds(),
+            quality=quality_report(),
+            features=features(),
+        )
+        assert entered.state is TradeState.LONG
+
     def test_cost_gate_can_block_entry(self) -> None:
         clock = ManualClock()
         state_config = StateMachineConfig(
