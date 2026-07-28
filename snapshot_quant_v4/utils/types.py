@@ -316,6 +316,8 @@ class QualityReport:
     book_quality: float
     liquidity_score: float
     detail: str = ""
+    spread_bps: float | None = None
+    spread_limit_ticks: float | None = None
 
 
 # --------------------------------------------------------------------------- #

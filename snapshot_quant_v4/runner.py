@@ -377,7 +377,10 @@ class EngineRunner:
     def _log_waiting_symbol(self, symbol: str, token: str, *, event: str) -> None:
         """Keep configured symbols visible even before their first good tick."""
         _LOGGER.warning(
-            "LIVE STATUS event=%s symbol=%s token=%s ltp=n/a "
+            "LIVE STATUS event=%s symbol=%s token=%s ltp_rupees=n/a "
+            "bid_rupees=n/a bid_qty=n/a ask_rupees=n/a ask_qty=n/a "
+            "spread_rupees=n/a spread_ticks=n/a spread_bps=n/a "
+            "spread_limit_ticks=n/a tick_size_rupees=n/a "
             "model_signal=WAIT signal_type=NO_DATA state=NO_DATA position=FLAT "
             "score=n/a confidence=0%% quality=NO_ACCEPTED_SNAPSHOT "
             "snapshot_index=0 exchange_ms=0 data_age=n/a processed=%d",
@@ -407,6 +410,12 @@ class EngineRunner:
             else "n/a"
         )
         model_signal, signal_type = self._model_signal(output)
+        spread_bps = output.quality.spread_bps
+        if spread_bps is None:
+            spread_bps = output.snapshot.spread * 10_000.0 / output.snapshot.mid
+        spread_limit_ticks = output.quality.spread_limit_ticks
+        if spread_limit_ticks is None:
+            spread_limit_ticks = self._config.quality.max_signal_spread_ticks
         data_age_s = max(
             0.0,
             (
@@ -416,7 +425,10 @@ class EngineRunner:
             / 1000.0,
         )
         _LOGGER.info(
-            "LIVE STATUS event=%s symbol=%s token=%s ltp=%.2f "
+            "LIVE STATUS event=%s symbol=%s token=%s ltp_rupees=%.6f "
+            "bid_rupees=%.6f bid_qty=%d ask_rupees=%.6f ask_qty=%d "
+            "spread_rupees=%.6f spread_ticks=%.6f spread_bps=%.6f "
+            "spread_limit_ticks=%.6f tick_size_rupees=%.6f "
             "model_signal=%s signal_type=%s state=%s position=%s score=%s "
             "confidence=%.0f%% quality=%s snapshot_index=%d exchange_ms=%d "
             "data_age=%.1fs",
@@ -424,6 +436,15 @@ class EngineRunner:
             output.symbol,
             output.token,
             output.snapshot.last_traded_price,
+            output.snapshot.best_bid.price,
+            output.snapshot.best_bid.quantity,
+            output.snapshot.best_ask.price,
+            output.snapshot.best_ask.quantity,
+            output.snapshot.spread,
+            output.snapshot.spread_ticks,
+            spread_bps,
+            spread_limit_ticks,
+            output.snapshot.tick_size,
             model_signal,
             signal_type,
             output.state.value,
